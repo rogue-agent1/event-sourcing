@@ -1,63 +1,52 @@
 #!/usr/bin/env python3
-"""Event sourcing — append-only event store with projections and replay."""
-import sys, json, time, uuid
+"""Event sourcing — append-only event log with projections."""
+import json, time, sys
+
+class Event:
+    def __init__(self, type, data, aggregate_id, version=0):
+        self.type = type; self.data = data; self.aggregate_id = aggregate_id
+        self.version = version; self.timestamp = time.time()
+    def __repr__(self): return f"Event({self.type}, v{self.version})"
 
 class EventStore:
     def __init__(self):
         self.events = []; self.snapshots = {}
-    def append(self, stream, event_type, data):
-        event = {"id": str(uuid.uuid4())[:8], "stream": stream, "type": event_type,
-                 "data": data, "ts": time.time(),
-                 "version": sum(1 for e in self.events if e["stream"] == stream) + 1}
-        self.events.append(event)
-        return event
-    def stream(self, name):
-        return [e for e in self.events if e["stream"] == name]
-    def project(self, name, projector, initial=None):
-        state = dict(initial or {})
-        for e in self.stream(name):
-            state = projector(state, e)
-        return state
-    def streams(self):
-        return sorted(set(e["stream"] for e in self.events))
+    def append(self, event):
+        event.version = len([e for e in self.events if e.aggregate_id == event.aggregate_id])
+        self.events.append(event); return event
+    def get_events(self, aggregate_id, after_version=-1):
+        return [e for e in self.events if e.aggregate_id == aggregate_id and e.version > after_version]
+    def snapshot(self, aggregate_id, state, version):
+        self.snapshots[aggregate_id] = {"state": state, "version": version}
 
-def account_projector(state, event):
-    s = dict(state)
-    if "balance" not in s: s["balance"] = 0; s["txns"] = 0
-    if event["type"] == "deposit": s["balance"] += event["data"]["amount"]
-    elif event["type"] == "withdraw": s["balance"] -= event["data"]["amount"]
-    s["txns"] += 1
-    return s
-
-def cart_projector(state, event):
-    s = dict(state)
-    if "items" not in s: s["items"] = {}; s["total"] = 0
-    d = event["data"]
-    if event["type"] == "item_added":
-        s["items"][d["item"]] = s["items"].get(d["item"], 0) + d.get("qty", 1)
-        s["total"] += d["price"] * d.get("qty", 1)
-    elif event["type"] == "item_removed" and d["item"] in s["items"]:
-        del s["items"][d["item"]]
-    return s
+class BankAccount:
+    def __init__(self, account_id, store):
+        self.id = account_id; self.store = store; self.balance = 0; self.version = -1
+    def _apply(self, event):
+        if event.type == "deposited": self.balance += event.data["amount"]
+        elif event.type == "withdrawn": self.balance -= event.data["amount"]
+        self.version = event.version
+    def deposit(self, amount):
+        e = self.store.append(Event("deposited", {"amount": amount}, self.id))
+        self._apply(e)
+    def withdraw(self, amount):
+        if amount > self.balance: raise ValueError("Insufficient funds")
+        e = self.store.append(Event("withdrawn", {"amount": amount}, self.id))
+        self._apply(e)
+    def rebuild(self):
+        self.balance = 0; self.version = -1
+        snap = self.store.snapshots.get(self.id)
+        if snap: self.balance = snap["state"]["balance"]; self.version = snap["version"]
+        for e in self.store.get_events(self.id, self.version): self._apply(e)
 
 if __name__ == "__main__":
     store = EventStore()
-    store.append("acct-1", "deposit", {"amount": 1000})
-    store.append("acct-1", "withdraw", {"amount": 200})
-    store.append("acct-1", "deposit", {"amount": 500})
-    store.append("acct-2", "deposit", {"amount": 5000})
-    store.append("acct-2", "withdraw", {"amount": 1500})
-    store.append("cart-1", "item_added", {"item": "laptop", "price": 999, "qty": 1})
-    store.append("cart-1", "item_added", {"item": "mouse", "price": 29, "qty": 2})
-    print("=== Event Sourcing Demo ===\n")
-    for s in store.streams():
-        if s.startswith("acct"):
-            state = store.project(s, account_projector)
-            print(f"{s}: balance=${state['balance']}, {state['txns']} transactions")
-        elif s.startswith("cart"):
-            state = store.project(s, cart_projector)
-            print(f"{s}: {state['items']}, total=${state['total']}")
-        for e in store.stream(s):
-            print(f"  [{e['version']}] {e['type']}: {e['data']}")
-        print()
-    print(f"Total events: {len(store.events)}")
+    acc = BankAccount("ACC-001", store)
+    acc.deposit(1000); acc.deposit(500); acc.withdraw(200)
+    print(f"Balance: ${acc.balance}")
+    print(f"Events: {store.get_events('ACC-001')}")
+    store.snapshot("ACC-001", {"balance": acc.balance}, acc.version)
+    acc.deposit(100)
+    acc2 = BankAccount("ACC-001", store)
+    acc2.rebuild()
+    print(f"Rebuilt from snapshot: ${acc2.balance}")
